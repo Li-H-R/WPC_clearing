@@ -1,0 +1,406 @@
+from find_fitPoint import pseudo_wind_power_curve
+
+from db_raed import ScadaRead_WP
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+from matplotlib import rcParams
+
+config = {
+    "font.family": 'serif',
+    "font.size": 18,  # 相当于小四大小
+    "mathtext.fontset": 'stix',  # matplotlib渲染数学字体时使用的字体，和Times New Roman差别不大
+    "font.serif": ['Times New Roman'],  # 宋体
+    'axes.unicode_minus': False  # 处理负号，即-号
+}
+rcParams.update(config)
+
+def cubic_function(x, a, b, c, d):
+    return a * x ** 3 + b * x ** 2 + c * x + d
+
+
+def cubic_function_z(xx, par, z_score):
+    """
+    标准化理想数据
+    :param xx: 输入数据（标准化后）
+    :param par: 曲线参数
+    :return:
+    """
+    uu = z_score.inverse_transform(xx)
+    pp = cubic_function(uu[:, 0], *par)
+    new_array = np.column_stack((pp, pp))
+    power_hope_my = z_score.transform(new_array)[:, 1]
+
+    return power_hope_my
+
+def reference_unit_vector(wind_power0, parameter_r, z_score_r):
+    """
+
+    :param wind_power: 风功率数据
+    :return:
+    """
+    wind_power = z_score_r.inverse_transform(wind_power0)
+
+    keth = 0.1
+    wind_right = wind_power[:, 0] + keth
+    wind_left = wind_power[:, 0] - keth
+
+    power_right = cubic_function(wind_right, *parameter_r)
+    power_left = cubic_function(wind_left, *parameter_r)
+
+    wp_right = np.dstack([wind_right, power_right]).reshape(-1, 2)
+    wp_left = np.dstack([wind_left, power_left]).reshape(-1, 2)
+    wp_right = z_score_r.transform(wp_right)
+    wp_left = z_score_r.transform(wp_left)
+    delta_wp = np.abs(wp_right - wp_left)
+
+    norm_vector = np.linalg.norm(delta_wp, axis=1)
+    # 计算向量的长度（模）并将向量除以长度得到单位向量
+    reference_v = delta_wp / norm_vector[:, np.newaxis]
+    # 绘制数据点
+    # plt.scatter(wind_power0[:, 0], wind_power0[:, 1])
+    # # 绘制箭头
+    # for i in range(len(wind_power0)):
+    #     plt.arrow(wind_power0[i, 0], wind_power0[i, 1], delta_wp[i, 0]/10, delta_wp[i, 1]/10)
+    # plt.show()
+
+    return reference_v
+
+
+def Trend_index_vector(wind_power, ref_vector, threshold, k1):
+    # 横向向量
+    Transverse_vector = np.array([[1, 0]])
+    n_neighbors = min([len(wind_power), k1 + 1])
+    nn = NearestNeighbors(n_neighbors=n_neighbors)
+    nn.fit(wind_power)
+    dist, index = nn.kneighbors(wind_power)  # ind 为对应点周围数据的编号 6个
+
+    dist1 = dist[:, 1:]
+    index1 = index[:, 1:]
+
+    Index_table = np.copy(wind_power)
+
+    for i, dist_vector in enumerate(dist1):
+        vector = wind_power[index1[i][dist_vector <= threshold]] - wind_power[index[i, 0]]
+
+        if vector.any():
+            index_select = index1[i][dist_vector <= threshold]
+
+            norm = np.linalg.norm(vector, axis=1).reshape(-1, 1)
+
+            # 单位化
+            vector_unit = vector / (norm * np.ones([1, 2]) + 1e-8)
+
+            # 递增趋势
+            IncrementCandidateIndex = index_select[(vector_unit[:, 1] > 0) * (vector_unit[:, 0] >= 0)]
+
+            if not any(IncrementCandidateIndex):
+                Index_table[i, 0] = -1
+                ########
+                Constant_trend = np.dot(vector_unit, Transverse_vector.T)
+                if np.max(Constant_trend) > 0:
+                    Index_table[i, 1] = index_select[np.argmax(Constant_trend)]
+                else:
+                    Index_table[i, 1] = -1
+                ########
+
+            else:
+                Increasing_trend = np.dot(vector_unit[(vector_unit[:, 1] > 0) * (vector_unit[:, 0] >= 0)],
+                                          ref_vector[i].T)
+
+                if np.max(Increasing_trend) <= 0:  # 没有递增的趋势
+                    print('如果发生，地球就不存在')
+                    Index_table[i, 0] = -1
+                    ########
+                    Constant_trend = np.dot(vector_unit, Transverse_vector.T)
+                    if np.max(Constant_trend) > 0:
+                        Index_table[i, 1] = index_select[np.argmax(Constant_trend)]
+                    else:
+                        Index_table[i, 1] = -1
+                    ########
+                else:  # 存在递增的趋势
+                    # 得到递增的临时索引
+
+                    # 临时参数
+
+                    ConstantTemporaryIndex2 = -1
+                    IncrementalTemporaryIndex2 = -1
+
+                    IncrementalTemporaryIndex = IncrementCandidateIndex[np.argmax(Increasing_trend)]
+                    IncrementalTemporaryValue = np.max(Increasing_trend)
+
+                    if len(Increasing_trend) > 1:
+                        second_value_increment = np.sort(-Increasing_trend.reshape(-1))[1]
+                        if second_value_increment < 0:
+                            IncrementalTemporaryIndex2 = IncrementCandidateIndex[
+                                np.argsort(-Increasing_trend.reshape(-1))[1]]
+
+                    # 常数趋势
+                    ConstantCandidateIndex = index_select[vector_unit[:, 1] < ref_vector[i, 1]]
+                    if not any(ConstantCandidateIndex):
+                        Index_table[i, 0] = IncrementalTemporaryIndex
+                        Index_table[i, 1] = -1
+                    else:
+                        Constant_trend = np.dot(vector_unit[vector_unit[:, 1] < ref_vector[i, 1]], Transverse_vector.T)
+                        if np.max(Constant_trend) <= 0:  # 没有平稳的趋势
+                            Index_table[i, 0] = IncrementalTemporaryIndex
+                            Index_table[i, 1] = -1
+                        else:  # 存在平稳的趋势
+                            # 得到平稳的临时索引
+                            ConstantTemporaryIndex = ConstantCandidateIndex[np.argmax(Constant_trend)]
+
+                            ConstantTemporaryValue = np.max(Constant_trend)
+
+                            if len(Constant_trend) > 1:
+                                second_value_constant = np.sort(-Constant_trend.reshape(-1))[1]
+                                if second_value_constant < 0:
+                                    ConstantTemporaryIndex2 = ConstantCandidateIndex[
+                                        np.argsort(-Constant_trend.reshape(-1))[1]]
+
+                            if ConstantTemporaryIndex != IncrementalTemporaryIndex:
+                                Index_table[i, 0] = IncrementalTemporaryIndex
+                                Index_table[i, 1] = ConstantTemporaryIndex
+                            else:
+
+                                if ConstantTemporaryValue <= IncrementalTemporaryValue:
+                                    Index_table[i, 0] = IncrementalTemporaryIndex
+                                    Index_table[i, 1] = ConstantTemporaryIndex2
+                                else:
+                                    Index_table[i, 0] = IncrementalTemporaryIndex2
+                                    Index_table[i, 1] = ConstantTemporaryIndex
+        else:
+            # 对于离群点进行剔除
+            Index_table[i, 0] = -1
+            Index_table[i, 1] = -1
+
+    return Index_table
+
+
+def hori_detect_T(x, k):
+    """
+    横向检测阈值
+    :param x:
+    :return:
+    """
+
+    O = np.concatenate(x, axis=0)
+    O_Data = np.unique(O, axis=0)
+
+    n_neighbors = min([len(O_Data), k + 1])
+    nn = NearestNeighbors(n_neighbors=n_neighbors)
+    nn.fit(O_Data)
+    dist, index = nn.kneighbors(O_Data)  # ind 为对应点周围数据的编号 6个
+
+    T = np.sum(dist[:, 1:] * weight(dist[:, 1:]), axis=1)  # 阈值
+    T_Adaptive1 = np.max(np.array([np.median(T), np.mean(T)])) + np.abs(np.median(T) - np.mean(T)) * 3 / 2
+    return T_Adaptive1
+
+
+def weight(dist):
+    k = dist.shape[1]
+    Sum = np.sum(dist, axis=1)
+    Sum = Sum.reshape(-1, 1)
+    Sum_m = Sum * np.ones([1, k]) + 1e-8
+
+    weight_m = (1 - (dist / Sum_m)) / (k - 1)
+
+    return weight_m
+
+
+def partition_process_c2(data, v1, v2, z_score):
+    """
+
+    :param data: 原始数据
+    :param v1: 切入风速
+    :param v2:额定风速
+    :return: 分段数据
+    """
+    v_cutIn_z = z_score.transform(np.array([[v1, v1]]))[0, 0]
+    v_rated_z = z_score.transform(np.array([[v2, v2]]))[0, 0]
+
+    # 第2工况原始数据
+    data_c2 = data[np.logical_and(data[:, 0] > v_cutIn_z, data[:, 0] <= v_rated_z)]
+
+    boundaries = np.linspace(v_cutIn_z, v_rated_z, np.floor(v2 - v1 + 1).astype(int))
+    add_new_par = []
+    segments = np.digitize(data_c2[:, 0], boundaries)
+    for i in range(1, len(boundaries)):
+        segment_data = data_c2[segments == i]
+        if len(segment_data) > 0:
+            add_new_par.append(segment_data)
+
+    return add_new_par
+
+
+def Kernel_data_approximate(x, y, hh=0.5):
+    value1 = np.exp(-((x - y) ** 2) / (2 * hh * hh))
+    x_approximate = x + (1 - value1) * (y - x)
+
+    return x_approximate, value1
+
+
+def Recursively_searching(tabel_list, index, a):
+    a += 1
+    # print(tabel_list[int(index)])
+
+    if tabel_list[int(index)] == -1:
+        return a
+    else:
+        y = Recursively_searching(tabel_list, tabel_list[int(index)], a)
+    return y
+
+
+def Trend_detect(table, Knowledge_ref, Knowledge_org, M, data_approximate, id_flag):
+    """
+
+    :param table: 索引列表
+    :param Knowledge_ref: 功率参考值，对于大于该值的数据进行保留
+    :param Knowledge_org: 功率原始值，对于大于该值的数据进行保留
+    :param data_approximate: 近似数据id_flag
+    :param id_flag: 判断是否原始值中位数在近似参考值范围内
+
+    :return:
+    """
+    detect_index = np.copy(table[:, 1])
+    median_org = np.median(Knowledge_org)
+
+    for i, value in enumerate(table):
+
+        if id_flag:
+            kk = data_approximate[i]
+        else:
+            kk = Knowledge_ref[i] + (median_org - M)
+
+        if kk <= Knowledge_org[i]:
+            detect_index[i] = True
+
+        else:
+            if value[1] == -1:
+                detect_index[i] = True
+            else:
+                if value[0] == -1:
+                    detect_index[i] = False
+                else:
+
+                    Increase_number = Recursively_searching(table[:, 0], value[0], a=1)
+                    Constant_number = Recursively_searching(table[:, 1], value[1], a=1)
+
+                    if Increase_number >= Constant_number:
+                        detect_index[i] = True
+                    else:
+                        detect_index[i] = False
+
+    return detect_index
+
+
+def cleaning_condition2(x_data, parameter, z_score, k_neight_T=25, k_neight_S=40):
+    """
+
+    :param x_data: 分段数据(3列-风速,功率,理想功率)
+    :param parameter: 拟合曲线参数
+    :param z_score: 标准化
+    :param k_neight_T: 横向检测半径近邻值数
+    :param k_neight_S: 横向检测单点搜索近邻数
+    :return: 清洗后结果
+    """
+    data_clear_after = []
+    abnormal_data_after = []
+    # 自适应半径
+    T_Adaptive = hori_detect_T(x=x_data, k=k_neight_T)
+
+    for _, xx in enumerate(x_data):
+        # 剔除重复值
+        data_uni, _ = np.unique(xx, axis=0, return_index=True)
+
+        data_good = data_uni
+        # plt.scatter(data_uni[:, 0], data_uni[:, 1])
+        # plt.scatter(data_uni[ind, 0], data_uni[ind, 1])
+        # plt.show()
+        ref_vector = reference_unit_vector(data_good, parameter, z_score)
+
+        INDEX_TABLE = Trend_index_vector(data_good, ref_vector, T_Adaptive, k1=k_neight_S)
+
+        power_org = data_good[:, 1]
+        power_hope0 = cubic_function_z(data_good, parameter, z_score)
+
+        # 功率近似值
+        p_approximate1, _ = Kernel_data_approximate(power_org, power_hope0)
+
+        if (np.median(data_good[:, 1]) < np.min(p_approximate1)) | (
+                np.median(data_good[:, 1]) > np.max(p_approximate1)):
+            ID = True
+        else:
+            ID = False
+
+        detect_index = Trend_detect(INDEX_TABLE, power_hope0, power_org, np.median(power_hope0),
+                                    p_approximate1, ID)
+
+        # 通过趋势检测后的数据
+        data_detect_after = data_good[detect_index == True]
+        abnormal_data = data_good[detect_index == False]
+        data_clear_after.append(data_detect_after)
+        abnormal_data_after.append(abnormal_data)
+
+
+    return data_clear_after, np.vstack(abnormal_data_after)
+
+
+def horizontal_trend_clearing(wp):
+    # 使用StandardScaler进行Z-score标准化
+    scaler = StandardScaler()
+    data_z = scaler.fit_transform(wp)
+    _, v_cutIn, v_rated, prop, _ = pseudo_wind_power_curve(wp)
+
+    # 将理想功率列拼接到原始数据中
+    # trend_wp_data_z = scaler.transform(trend_wp)
+    # trend_power_column = trend_wp_data_z[:, -1]
+    # originData_con_trendData = np.concatenate((data_z, trend_power_column[:, np.newaxis]), axis=1)
+
+    # 数据分段
+    partition_data = partition_process_c2(data_z, v_cutIn, v_rated, scaler)
+
+    # 横向检测清洗
+    data_detect, abnormal = cleaning_condition2(partition_data, prop, scaler)
+
+    # 绘图
+    # abnormal = scaler.inverse_transform(abnormal)
+    # fig = plt.figure(figsize=(8, 6))  # 设置画布大小
+    # plt.scatter(wp[:, 0], wp[:, 1], label='Raw data', color=[0 / 255, 52 / 255, 245 / 255], s=2,
+    #             zorder=1)  # 设置v_p散点的样式和透明度
+    # plt.scatter(abnormal[:, 0], abnormal[:, 1], label='Data detected', color=[246 / 255, 1 / 255, 1 / 255], s=2,
+    #             zorder=2)
+    # y = np.linspace(-100, 2400, 100)
+    # x = v_rated * np.ones_like(y)
+    # x1 = v_cutIn * np.ones_like(y)
+    # plt.plot(x, y, color=[0 / 255, 24 / 255, 134 / 255], linestyle='--', zorder=3)  # 设置直线的样式和颜色
+    # plt.plot(x1, y, color=[0 / 255, 24 / 255, 134 / 255], linestyle='--', zorder=3)  # 设置直线的样式和颜色
+    # # 设置图例
+    # plt.legend(loc='best', fontsize=14)  # 放置图例在最合适的位置
+    #
+    # # 设置坐标轴标签和标题
+    # plt.xlabel('Wind Speed(m/s)')
+    # plt.ylabel('Wind Power(kW)')
+    #
+    # # 设置坐标轴范围
+    # plt.xlim([0, 25])
+    # plt.ylim([-100, 2300])
+    # plt.show()
+    # fig.savefig(r"C:\Users\admin\Desktop\fig2.png", format='png', dpi=600)
+
+    return data_detect, prop, scaler
+
+
+if __name__ == '__main__':
+
+    data_name = "B13_201706"  # 替换为你需要的变量值
+
+    # data_preprocess
+    query0 = "SELECT 30秒平均风速, 有功功率 FROM " + data_name
+    wp_get = ScadaRead_WP()
+    wind_speed1, _ = wp_get.scada_data(query0, data_name)
+    wind_speed1 = np.delete(wind_speed1, np.where(wind_speed1[:, 0] < 0), axis=0)
+    wind_speed1 = np.delete(wind_speed1, np.where(wind_speed1[:, 1] < 0), axis=0)
+    data_detect1 = horizontal_trend_clearing(wind_speed1)
+    # plt.scatter(data_detect1[0][:, 0], data_detect1[0][:, 1])
+    # plt.show()
